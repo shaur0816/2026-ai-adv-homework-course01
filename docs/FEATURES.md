@@ -139,9 +139,10 @@
 
 ## 4. 訂單（Orders，使用者）— ✅
 
-對應檔案：`src/routes/orderRoutes.js`
+對應檔案：`src/routes/orderRoutes.js`、`src/services/ecpay.js`、`src/routes/paymentRoutes.js`
 
-整個 router 套用 `authMiddleware`（`router.use(authMiddleware)`），所有端點必須帶 JWT。
+整個 `/api/orders` router 套用 `authMiddleware`（`router.use(authMiddleware)`），所有端點必須帶 JWT。
+ECPay 公開路由（`/payment/*`、`/ecpay/notify`）在 `paymentRoutes.js` 內定義，不經 `authMiddleware`，但內部呼叫的 `/api/orders/:id/ecpay-checkout` 與 `/api/orders/:id/ecpay-query` 仍需 JWT，由前端從 localStorage 補上 `Authorization` header。
 
 ### 4.1 建立訂單 `POST /api/orders`
 
@@ -192,7 +193,90 @@
 4. `actionMap = { success: 'paid', fail: 'failed' }`；UPDATE status。
 5. 回 200，`data = { ...訂單, items: [...] }`；`message` 為「付款成功」或「付款失敗」。
 
-**非標準機制**：沒有任何金流串接。前端按下「模擬付款成功 / 失敗」按鈕直接呼叫此 API。`.env` 的 ECPAY_* 變數**未被使用**。
+**目前狀態**：**前台已不再呼叫此 API**（checkout 完成後改為導向 `/payment/ecpay/:id` 走真實綠界流程）。此端點保留主要是為了：
+- `tests/orders.test.js` 仍依賴它測試訂單狀態轉換。
+- 後台或開發環境需要手動把訂單翻牌時可用。
+
+### 4.5 產生綠界 ECPay 付款參數 `POST /api/orders/:id/ecpay-checkout`
+
+**行為**：產生跳轉至綠界 AIO 付款頁所需的 form 參數（含 `CheckMacValue`），並回傳目標 URL 與 method，由前端組成 hidden form 後 submit 至綠界。
+
+**前置條件**：
+- 訂單必須屬於登入使用者，否則 404 `NOT_FOUND`。
+- 訂單 `status` 必須為 `pending`，否則 400 `INVALID_STATUS`「訂單狀態不是 pending，無法重新付款」。
+
+**業務邏輯**：
+1. 以 `crypto.randomBytes(4)` 產生新的 `MerchantTradeNo`（格式 `EC<13 位毫秒時間戳><8 位 hex>`，截長至 ≤ 20 字元、純英數字），覆寫 `orders.ecpay_trade_no`。**MerchantTradeNo 永久唯一**，所以重試付款必須產生新值。
+2. 透過 `src/services/ecpay.js` 的 `buildAioCheckoutParams` 組出 AIO 參數，固定 `ChoosePayment=Credit`、`EncryptType=1`。`ItemName` 以 `<商品名> x<數量>` 並以 `#` 串接，做過控制字元與 `<>` 過濾，並截長至 200 字元。
+3. `ReturnURL` 帶入 `<BASE_URL>/api/orders/ecpay/notify`；`OrderResultURL` 帶入 `<BASE_URL>/payment/return/:id`；`ClientBackURL` 帶入 `<BASE_URL>/orders/:id?payment=cancel`。`BASE_URL` 取自 `process.env.BASE_URL`，缺時 fallback 為當前請求的 `protocol://host`。
+4. 計算 `CheckMacValue`（SHA256 + `ecpayUrlEncode`：urlencode → toLowerCase → .NET 字元還原），附在參數最後。
+
+**回應 data**：
+```json
+{
+  "action": "https://payment-stage.ecpay.com.tw/Cashier/AioCheckOut/V5",
+  "method": "POST",
+  "params": {
+    "MerchantID": "...",
+    "MerchantTradeNo": "EC...",
+    "MerchantTradeDate": "2026/05/15 17:30:00",
+    "PaymentType": "aio",
+    "TotalAmount": 1680,
+    "TradeDesc": "Flower Life 訂單付款",
+    "ItemName": "粉色玫瑰花束 x1",
+    "ReturnURL": "...",
+    "ChoosePayment": "Credit",
+    "EncryptType": 1,
+    "OrderResultURL": "...",
+    "ClientBackURL": "...",
+    "CheckMacValue": "..."
+  }
+}
+```
+
+**前端流程**：`/payment/ecpay/:id` 頁面載入後呼叫此 API → 把 `params` 全部寫入 hidden input → `form.submit()` 跳轉到綠界。
+
+### 4.6 主動查詢綠界付款結果 `POST /api/orders/:id/ecpay-query`
+
+**行為**：本地端主動呼叫綠界 `QueryTradeInfo/V5` 取得最新付款狀態並冪等更新訂單。**本機環境收不到 Server Notify，這是付款結果確認的唯一來源**。
+
+**前置條件**：
+- 訂單必須屬於登入使用者，否則 404 `NOT_FOUND`。
+- 訂單 `ecpay_trade_no` 必須有值（曾經呼叫過 `ecpay-checkout`），否則 400 `NO_ECPAY_TRADE`「此訂單尚未發起綠界付款」。
+
+**業務邏輯**：
+1. 用 `ecpay_trade_no` 作為 `MerchantTradeNo`，加上 Unix 秒級 `TimeStamp`（**3 分鐘有效期**，每次呼叫重新產生）與 `CheckMacValue`，以 `Content-Type: application/x-www-form-urlencoded` POST 到 `/Cashier/QueryTradeInfo/V5`。
+2. 解析綠界回傳的 URL-encoded 字串，使用 `crypto.timingSafeEqual` 驗證 `CheckMacValue`，驗章失敗 → 502「綠界查詢回應驗章失敗」。
+3. 依 `TradeStatus` 決定後續：
+   - `1`（已付款）：**先驗證 `TradeAmt === orders.total_amount`**，金額不符 → 502 `AMOUNT_MISMATCH`「綠界回傳金額與訂單金額不符」。通過則 status 轉為 `paid`。
+   - `10200095`（交易未成立）：status 轉為 `failed`。
+   - `0`（未付款）／`10200047`（訂單不存在於綠界）／其他：**不變動訂單 status**，僅返回查詢結果讓前端顯示「尚未確認」訊息。
+4. 若狀態有變動或 `TradeNo` 不同，UPDATE 訂單：寫入 `status`、`ecpay_tx_no`（綠界端 TradeNo）、`payment_method`（PaymentType，如 `Credit_CreditCard`）、`paid_at`（綠界回傳的 `PaymentDate`）。
+5. **冪等保證**：同一筆訂單重複查詢，只要 TradeStatus 不變且 TradeNo 不變，就不會重複寫入；庫存在建單時已扣，付款結果不會再動庫存。
+
+**回應 data**：
+```json
+{
+  "order": { ...完整訂單欄位含 ecpay_trade_no/ecpay_tx_no/payment_method/paid_at },
+  "ecpay": {
+    "MerchantTradeNo": "EC...",
+    "TradeNo": "230615000000123",
+    "TradeStatus": "1",
+    "PaymentType": "Credit_CreditCard",
+    "PaymentDate": "2026/05/15 17:35:21",
+    "TradeAmt": 1680
+  }
+}
+```
+
+**錯誤情境**：
+- 502「無法連線到綠界查詢服務」：fetch 失敗（網路問題）。
+- 502「綠界查詢服務回應 HTTP <code>」：綠界回非 2xx。
+- 502「綠界查詢回應驗章失敗」：CheckMacValue 不符（可能 HashKey/HashIV 錯誤或回應遭竄改）。
+- 502 `AMOUNT_MISMATCH`：金額遭竄改。
+- 400 `NO_ECPAY_TRADE`：訂單尚未走過 `ecpay-checkout`。
+
+**安全提醒**：CheckMacValue 比對使用 `crypto.timingSafeEqual` 而非 `===`，避免 timing attack。`HashKey` / `HashIV` 從環境變數讀取，**絕對不可寫入前端或版本控制**。
 
 ---
 
@@ -280,7 +364,9 @@ router 套用 `authMiddleware + adminMiddleware`。
 | `/checkout` | `checkout.ejs` | `checkout.js` | `Auth.requireAuth()` 守門；若購物車為空自動 redirect 回 `/cart` |
 | `/login` | `login.ejs` | `login.js` | 登入/註冊雙 tab；登入後依 `?redirect=` 導回原頁，否則回首頁 |
 | `/orders` | `orders.ejs` | `orders.js` | 列出自己訂單，三色 status badge |
-| `/orders/:id` | `order-detail.ejs` | `order-detail.js` | 顯示明細；pending 訂單顯示「模擬付款成功 / 失敗」按鈕；`?payment=success/failed/cancel` 會顯示對應條幅 |
+| `/orders/:id` | `order-detail.ejs` | `order-detail.js` | 顯示明細；pending 訂單顯示「前往綠界付款」與「主動向綠界查詢付款結果」兩顆按鈕；`?payment=success/failed/cancel/pending` 會顯示對應條幅；若狀態仍是 pending 且帶有 `?payment=` 參數（從綠界導回的情境），會自動觸發一次主動查詢 |
+| `/payment/ecpay/:id` | （server-render） | — | 載入後 fetch `/api/orders/:id/ecpay-checkout` 取得 AIO 參數，組 hidden form 自動 submit 跳轉至綠界付款頁；未登入導去 `/login` |
+| `/payment/return/:id` | （server-render） | — | 綠界 OrderResultURL 落地頁，顯示「處理中…」並立刻 POST `/api/orders/:id/ecpay-query`，依結果 redirect 回 `/orders/:id?payment=success\|failed\|pending` |
 
 ### 前端共用機制
 
@@ -332,7 +418,7 @@ Sidebar (`views/partials/admin-sidebar.ejs`) 透過 `currentPath` locals（由 p
 下列為已知未實作但可能會被預期的功能：
 
 - ❌ **登入後合併訪客購物車**：登入時不會把 `session_id` 列搬到 `user_id`。
-- ❌ **真實金流（ECPay）整合**：`.env` 變數保留但程式碼未使用。
+- ✅ **真實金流（ECPay）整合**：已於 2026-05-15 完成。採綠界 AIO（信用卡）+ 本地主動查詢模式，見 §4.5 / §4.6。**未支援**：ATM／超商代碼／條碼（離線付款）、DoAction 退款、對帳檔下載。
 - ❌ **商品的 is_active / 上下架**：products 表無此欄位，刪除是唯一隱藏方式。
 - ❌ **使用者忘記密碼/重設密碼**。
 - ❌ **訂單取消**：使用者無 API 取消；admin 也無更新狀態 API。

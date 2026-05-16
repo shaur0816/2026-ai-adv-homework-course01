@@ -1,6 +1,6 @@
 # 花漾生活 Flower Life
 
-花卉電商網站 Demo。包含商品瀏覽、購物車、結帳下單、訂單付款模擬、後台商品/訂單管理。前後端一體：Express 同時提供 REST API（`/api/*`）與 SSR 頁面（EJS Layout + Vue 3 CDN）。
+花卉電商網站 Demo。包含商品瀏覽、購物車、結帳下單、綠界 ECPay 金流（信用卡，採本地主動查詢模式）、後台商品/訂單管理。前後端一體：Express 同時提供 REST API（`/api/*`）與 SSR 頁面（EJS Layout + Vue 3 CDN）。
 
 ## 技術棧
 
@@ -90,9 +90,10 @@ npm run dev:server
 ├── public/                 # 靜態檔（CSS、前端 JS）
 ├── views/                  # EJS 模板（layouts / pages / partials）
 ├── src/
-│   ├── database.js         # DB 初始化、建表、seed
+│   ├── database.js         # DB 初始化、建表、seed、idempotent ALTER 遷移
 │   ├── middleware/         # auth / admin / session / errorHandler
-│   └── routes/             # auth / products / cart / orders / adminProducts / adminOrders / pageRoutes
+│   ├── services/           # ecpay（綠界 AIO + QueryTradeInfo 封裝）
+│   └── routes/             # auth / products / cart / orders / adminProducts / adminOrders / pageRoutes / paymentRoutes（ECPay 跳轉與回來頁）
 ├── tests/                  # Vitest 測試
 └── docs/                   # 你正在看的這個目錄
 ```

@@ -59,15 +59,15 @@ return res.status(400).json({
 | --- | --- | --- | --- |
 | `JWT_SECRET` | JWT 簽章 secret，HS256 | **必填**，缺則 `server.js` 直接 `process.exit(1)` | 無 |
 | `PORT` | 伺服器監聽 port | 選填 | `3001` |
-| `BASE_URL` | 應用對外網址（OpenAPI server URL 可參考） | 選填 | `http://localhost:3001` |
+| `BASE_URL` | 應用對外網址。會用來組 ECPay `ReturnURL` / `OrderResultURL` / `ClientBackURL`，缺時 `orderRoutes.js` 會 fallback 為當前請求的 `protocol://host` | 選填 | `http://localhost:3001` |
 | `FRONTEND_URL` | CORS 允許的 origin | 選填 | `http://localhost:3001` |
 | `ADMIN_EMAIL` | seed 管理員帳號 | 選填 | `admin@hexschool.com` |
 | `ADMIN_PASSWORD` | seed 管理員密碼 | 選填 | `12345678` |
 | `NODE_ENV` | 環境模式 | 選填 | `undefined`（測試時設為 `test` 會讓 bcrypt saltRounds 降為 1） |
-| `ECPAY_MERCHANT_ID` | （保留，未使用） | — | `3002607` |
-| `ECPAY_HASH_KEY` | （保留，未使用） | — | — |
-| `ECPAY_HASH_IV` | （保留，未使用） | — | — |
-| `ECPAY_ENV` | （保留，未使用） | — | `staging` |
+| `ECPAY_MERCHANT_ID` | 綠界特店編號。由 `src/services/ecpay.js` 讀取，缺時 ecpay-checkout / ecpay-query 端點會 throw | 必填（如需金流） | `3002607`（綠界官方公開測試帳號） |
+| `ECPAY_HASH_KEY` | 綠界 HashKey（用於計算 CheckMacValue），**禁止寫入版本控制** | 必填（如需金流） | `pwFHCqoQZGmho4w6`（測試帳號） |
+| `ECPAY_HASH_IV` | 綠界 HashIV（用於計算 CheckMacValue），**禁止寫入版本控制** | 必填（如需金流） | `EkRm7iFT261dpevs`（測試帳號） |
+| `ECPAY_ENV` | `staging` 或 `production`，控制 AIO / QueryTradeInfo 端點 domain | 選填 | `staging` |
 
 - `.env.example` 提供模板，請以 `cp .env.example .env` 起步。
 - `.env` 已加入 `.gitignore`，不要 commit 真實 secret。
@@ -170,7 +170,14 @@ router.get('/', (req, res) => { ... });
 
 1. 修改 `CREATE TABLE IF NOT EXISTS` 區塊。**重點：`IF NOT EXISTS` 對既有資料庫不會 ALTER**，所以新增欄位需手動處理：
    - 開發階段最快：刪除 `database.sqlite*` 三檔讓專案重建（會遺失所有資料）。
-   - 正規做法：在 `initializeDatabase()` 末尾追加 `try { db.exec('ALTER TABLE ... ADD COLUMN ...'); } catch (e) {}` 之類的條件式遷移，並在 PR 描述清楚。
+   - 正規做法：在 `initializeDatabase()` 末尾以 `PRAGMA table_info()` 取得現有欄位，對缺少的欄位執行 `ALTER TABLE ADD COLUMN`，這是「idempotent 遷移」可重覆執行。**目前已採用此模式**（為 ECPay 整合補上 `orders.ecpay_trade_no` 等欄位）。範例：
+     ```js
+     const orderCols = db.prepare("PRAGMA table_info(orders)").all().map(c => c.name);
+     if (!orderCols.includes('ecpay_trade_no')) {
+       db.exec("ALTER TABLE orders ADD COLUMN ecpay_trade_no TEXT");
+     }
+     ```
+   - 新增欄位請延續這個模式（不要用 try/catch 吞錯誤），新加的欄位都應**可為 NULL** 或帶 DEFAULT，否則 ALTER 會對舊 row 失敗。
 2. 若新表，需要 seed 資料則仿照 `seedProducts()` 寫成獨立函式並於 `initializeDatabase()` 末尾呼叫。
 3. `created_at` / `updated_at` 一律使用 `TEXT NOT NULL DEFAULT (datetime('now'))`。更新時須手動 `SET updated_at = datetime('now')`（沒有 trigger）。
 
@@ -181,6 +188,17 @@ router.get('/', (req, res) => { ... });
 3. 在 `src/routes/pageRoutes.js` 加入 `router.get('/<path>', (req, res) => renderFront(res, '<name>', { title: '...', pageScript: '<name>' }))`。
    - 後台用 `renderAdmin` 並要傳 `currentPath` 讓 sidebar 高亮。
 4. **不要**從伺服器端傳機密資料（layout 沒有沙箱），所有資料都以 API 提供，由 `apiFetch` 讀取。
+
+### 新增第三方整合（service）
+
+純函式 / 對外 API 呼叫的封裝放在 `src/services/<name>.js`。已有範例：`src/services/ecpay.js`（綠界金流）。原則：
+
+1. **狀態與環境**：在檔案頂部從 `process.env` 讀設定，缺時透過 `assertConfigured()` 一次拋錯（`err.status = 500`，避免每個 caller 都檢查一遍）。
+2. **加密／簽章**：使用 Node 內建 `crypto`，避免引入額外套件。比對 hash 時使用 `crypto.timingSafeEqual` 而非 `===`，避免 timing attack。
+3. **HTTP 呼叫**：使用 Node 18+ 內建 `fetch`，包一層 try/catch 將網路錯誤、HTTP 非 2xx、回應格式錯誤分別轉成 `err.status = 502 / err.isOperational = true` 的可讀錯誤，讓 errorHandler 能轉出友善訊息。
+4. **不要在 service 內直接讀寫 DB**：DB 操作留在 route handler，service 只負責協議。這樣 service 可以在測試中 mock fetch 而不需要 DB。
+5. **測試**：對應的 `tests/<name>.test.js` 使用 `vi.spyOn(globalThis, 'fetch').mockImplementation(...)` mock 對外請求；驗證輸出應對齊官方提供的測試向量（若有）。
+6. **環境變數加入 `.env.example`**：所有讀取的 env var 必須出現在 `.env.example`，並在本文件「環境變數表」補上一列。
 
 ## 計畫歸檔流程
 
