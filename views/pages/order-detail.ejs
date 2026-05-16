@@ -71,21 +71,31 @@
     </div>
 
     <!-- Payment Buttons -->
-    <div v-if="order.status === 'pending'" class="flex gap-4">
+    <div v-if="order.status === 'pending'" class="flex flex-col sm:flex-row gap-3">
       <button
-        @click="handlePaySuccess"
+        @click="goEcpay"
         :disabled="paying"
-        class="bg-sage text-white px-8 py-3 rounded-full text-sm font-medium hover:bg-sage/90 transition-colors disabled:opacity-50"
+        class="bg-rose-primary text-white px-8 py-3 rounded-full text-sm font-medium hover:bg-rose-dark transition-colors disabled:opacity-50"
       >
-        {{ paying ? '處理中...' : '付款成功' }}
+        {{ paying ? '處理中...' : '前往綠界付款' }}
       </button>
       <button
-        @click="handlePayFail"
-        :disabled="paying"
-        class="bg-red-500 text-white px-8 py-3 rounded-full text-sm font-medium hover:bg-red-600 transition-colors disabled:opacity-50"
+        @click="queryPayment"
+        :disabled="querying"
+        class="border border-rose-primary text-rose-primary px-8 py-3 rounded-full text-sm font-medium hover:bg-rose-primary/5 transition-colors disabled:opacity-50"
       >
-        {{ paying ? '處理中...' : '付款失敗' }}
+        {{ querying ? '查詢中...' : '主動向綠界查詢付款結果' }}
       </button>
+    </div>
+    <p v-if="order.status === 'pending'" class="text-xs text-text-muted mt-3">
+      ※ 本機環境無法接收綠界 Server Notify，付款完成後請點「主動向綠界查詢付款結果」確認狀態。
+    </p>
+
+    <!-- Paid info -->
+    <div v-if="order.status === 'paid'" class="bg-sage/5 border border-sage/20 rounded-xl p-4 text-sm text-text-secondary mt-2 space-y-1">
+      <p v-if="order.payment_method">付款方式：{{ order.payment_method }}</p>
+      <p v-if="order.ecpay_tx_no">綠界交易編號：{{ order.ecpay_tx_no }}</p>
+      <p v-if="order.paid_at">付款時間：{{ order.paid_at }}</p>
     </div>
   </template>
 </div>

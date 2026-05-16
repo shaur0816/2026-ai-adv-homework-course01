@@ -68,6 +68,21 @@ function initializeDatabase() {
     );
   `);
 
+  // Lightweight migrations: idempotent ALTER TABLE for new columns
+  const orderCols = db.prepare("PRAGMA table_info(orders)").all().map(c => c.name);
+  if (!orderCols.includes('ecpay_trade_no')) {
+    db.exec("ALTER TABLE orders ADD COLUMN ecpay_trade_no TEXT");
+  }
+  if (!orderCols.includes('ecpay_tx_no')) {
+    db.exec("ALTER TABLE orders ADD COLUMN ecpay_tx_no TEXT");
+  }
+  if (!orderCols.includes('payment_method')) {
+    db.exec("ALTER TABLE orders ADD COLUMN payment_method TEXT");
+  }
+  if (!orderCols.includes('paid_at')) {
+    db.exec("ALTER TABLE orders ADD COLUMN paid_at TEXT");
+  }
+
   // Seed data
   seedAdminUser();
   seedProducts();

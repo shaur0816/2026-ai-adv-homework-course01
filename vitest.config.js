@@ -12,6 +12,7 @@ export default defineConfig({
         'tests/orders.test.js',
         'tests/adminProducts.test.js',
         'tests/adminOrders.test.js',
+        'tests/ecpay.test.js',
       ],
     },
     hookTimeout: 10000,
